@@ -264,6 +264,10 @@ abstract final class Pref {
     return preferCodecs;
   }
 
+  /// Android HDR 画面后端开关。默认开启，出问题时可在播放器设置里关掉。
+  static bool get enableHdrSurface =>
+      _setting.get(SettingBoxKey.enableHdrSurface, defaultValue: true);
+
   static String get hardwareDecoding => _setting.get(
     SettingBoxKey.hardwareDecoding,
     defaultValue: HwDecType.kHwdec,

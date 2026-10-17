@@ -19,7 +19,6 @@ import 'package:PiliPlus/http/video.dart';
 import 'package:PiliPlus/models/common/super_resolution_type.dart';
 import 'package:PiliPlus/models/common/video/audio_quality.dart';
 import 'package:PiliPlus/models/common/video/cdn_type.dart';
-import 'package:PiliPlus/models/common/video/video_decode_type.dart';
 import 'package:PiliPlus/models/common/video/video_quality.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/models_new/video/video_play_info/subtitle.dart';
@@ -37,6 +36,7 @@ import 'package:PiliPlus/pages/video/introduction/ugc/widgets/action_item.dart';
 import 'package:PiliPlus/pages/video/introduction/ugc/widgets/menu_row.dart';
 import 'package:PiliPlus/pages/video/widgets/header_mixin.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
+import 'package:PiliPlus/plugin/pl_player/hdr_backend.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
 import 'package:PiliPlus/services/shutdown_timer_service.dart'
@@ -583,18 +583,24 @@ class HeaderControlState extends State<HeaderControl>
                                 plPlayerController.onlyPlayAudio.value;
                             return ActionRowLineItem(
                               iconData: Icons.headphones,
-                              onTap: () {
-                                plPlayerController.onlyPlayAudio.value =
-                                    !onlyPlayAudio;
+                              onTap: () async {
+                                final next = !onlyPlayAudio;
+                                // HDR 时视频轨由 Media3 输出，切“听视频”前先收回 mpv，
+                                // 否则 vid 会被两套逻辑同时改写。
+                                if (next) {
+                                  await plPlayerController
+                                      .disableHdrForAudioOnly();
+                                }
+                                plPlayerController.onlyPlayAudio.value = next;
                                 final player =
                                     plPlayerController.videoPlayerController!;
-                                if (onlyPlayAudio &&
+                                if (!next &&
                                     player.state.tracks.video.length <= 2) {
                                   videoDetailCtr.playerInit();
                                 } else {
                                   player.setProperty(
                                     'file-local-options/vid',
-                                    onlyPlayAudio ? 'auto' : 'no',
+                                    next ? 'no' : 'auto',
                                   );
                                 }
                               },
@@ -614,6 +620,20 @@ class HeaderControlState extends State<HeaderControl>
                                 .continuePlayInBackground
                                 .value,
                           ),
+                        ),
+                      if (HdrBackend.supported)
+                        Obx(
+                          () {
+                            final enabled =
+                                plPlayerController.hdrSurfaceEnabled.value;
+                            return ActionRowLineItem(
+                              iconData: enabled ? Icons.hdr_on : Icons.hdr_off,
+                              onTap: () =>
+                                  plPlayerController.toggleHdrSurface(!enabled),
+                              text: " HDR 渲染 ",
+                              selectStatus: enabled,
+                            );
+                          },
                         ),
                     ],
                   ),
@@ -1089,17 +1109,23 @@ class HeaderControlState extends State<HeaderControl>
   // 选择解码格式
   void showSetDecodeFormats() {
     final firstCode = videoDetailCtr.firstVideo.quality.code;
-    // 当前视频可用的解码格式。HDR 三档只列出能保住 HDR 的编码，
-    // 否则手动切到 AVC/AV1 会把杜比视界 / HDR10 换成同画质的 SDR 流。
-    final videoFormat = videoInfo.supportFormats!;
+    // HDR 三档只能走 HEVC/杜比：切到 AVC/AV1 会直接掉成同画质的 SDR 流，
+    // 与其给出一个“看起来能选、其实会毁掉 HDR”的列表，不如直接说明。
     final locked = VideoUtils.hdrCodecPrefixes(firstCode);
+    if (locked != null) {
+      SmartDialog.showToast('HDR 画质固定使用 HEVC/杜比编码');
+      return;
+    }
 
+    final videoFormat = videoInfo.supportFormats!;
     final list = videoFormat
-        .firstWhere((e) => e.quality == firstCode)
+        .firstWhere(
+          (e) => e.quality == firstCode,
+          orElse: () => videoFormat.first,
+        )
         .codecs
-        ?.where((e) => locked == null || locked.any(e.startsWith))
-        .toList();
-    if (list == null) {
+        ?.toList();
+    if (list == null || list.isEmpty) {
       SmartDialog.showToast('当前视频不支持选择解码格式');
       return;
     }
@@ -1130,7 +1156,7 @@ class HeaderControlState extends State<HeaderControl>
                         itemCount: list.length,
                         itemBuilder: (context, index) {
                           final item = list[index];
-                          final format = VideoDecodeFormatType.fromString(item);
+                          final format = VideoUtils.decodeFormatOf(item);
                           final isCurr = curCodecs.any(item.startsWith);
                           return ListTile(
                             dense: true,

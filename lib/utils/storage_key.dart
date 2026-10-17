@@ -33,6 +33,9 @@ abstract final class SettingBoxKey {
       playerVolume = 'playerVolume',
       maxVolume = 'maxVolume';
 
+  /// 安卓：HDR 画质是否改用 Media3 SurfaceView 输出画面（实验特性）。
+  static const String enableHdrSurface = 'enableHdrSurface';
+
   static const String enableVerticalExpand = 'enableVerticalExpand',
       feedBackEnable = 'feedBackEnable',
       enableLongShowControl = 'enableLongShowControl',

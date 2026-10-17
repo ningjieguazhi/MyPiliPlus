@@ -101,6 +101,8 @@ class HdrBackend {
   }) {
     final channel = _viewChannel;
     if (channel == null) return Future.value();
+    // 换片后要重新等 STATE_READY，否则旧值会让 drift 在 0 位置上取样。
+    mediaReady = false;
     return channel.invokeMethod('open', {
       'url': url,
       'position': position.inMilliseconds,
@@ -127,6 +129,10 @@ class HdrBackend {
     'mode': switch (fit) {
       VideoFitType.fill => 'fill',
       VideoFitType.cover => 'cover',
+      VideoFitType.fitWidth => 'fitWidth',
+      VideoFitType.fitHeight => 'fitHeight',
+      VideoFitType.none => 'none',
+      VideoFitType.scaleDown => 'scaleDown',
       _ => 'contain',
     },
     if (ratio != null && ratio > 0) 'ratio': ratio,
@@ -170,10 +176,6 @@ class HdrBackend {
       speed: speed is num ? speed.toDouble() : null,
     );
   }
-
-  /// 用当前音频进度给画面定基准，只在画面进入 STATE_READY 后有效。
-  Future<void> anchor(Duration position) =>
-      _invoke('anchor', {'position': position.inMilliseconds});
 
   Future<void> _invoke(String method, [Map<String, Object>? args]) {
     final channel = _viewChannel;

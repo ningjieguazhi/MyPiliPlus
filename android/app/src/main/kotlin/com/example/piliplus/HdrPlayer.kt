@@ -154,6 +154,7 @@ class HdrPlayerView(
     private var reportedSize: VideoSize? = null
 
     /** 最近真正要上屏的帧 PTS。`currentPosition` 在 seek 后会立刻跳，画面还停在旧帧。 */
+    @Volatile
     private var lastRenderedPtsUs = C.TIME_UNSET
 
     private var seekAnswered = true
@@ -178,6 +179,16 @@ class HdrPlayerView(
     /** 视频自身的宽高比，旋转和像素宽高比都算进去。 */
     private var videoAspect = 0.0
 
+    /** 解码出来的画幅（未乘像素宽高比），`原始`/`限制` 两种模式要用。 */
+    private var videoPixelWidth = 0
+    private var videoPixelHeight = 0
+
+    /** 当前是否已经把这扇窗切成 HDR 色域。 */
+    private var hdrWindowEnabled = false
+
+    /** 已下发的 MediaCodec scaling mode，避免每次布局都重复设置。 */
+    private var appliedScalingMode = -1
+
     init {
         channel.setMethodCallHandler(this)
         // SurfaceView 自己有窗口，不该参与 Flutter 的命中测试，手势仍由外层处理。
@@ -188,14 +199,15 @@ class HdrPlayerView(
                 applyFit()
             }
         }
-        applyHdrWindow(true)
+        // 窗口色域要等拿到真实码流色彩信息再开：HDR 画质在缺流时会回退到
+        // SDR 编码，先把整窗切成 HDR 会让画面发灰。
         surfaceView.holder.addCallback(
             object : SurfaceHolder.Callback {
                 override fun surfaceCreated(holder: SurfaceHolder) {
                     if (!hiddenForPop && surfaceHidden) {
                         setSurfaceAlpha(0f)
                     }
-                    requestSurfaceHdrBrightness(true)
+                    requestSurfaceHdrBrightness(hdrWindowEnabled)
                 }
 
                 override fun surfaceChanged(
@@ -233,13 +245,6 @@ class HdrPlayerView(
                 player.setPlaybackSpeed(baseRate)
                 result.success(null)
             }
-            "anchor" -> {
-                // 基准只能靠真正跳转来定：把画面跳到音频时间戳上，两边从此按各自时钟走。
-                // 只把差值记进上报进度的话，日志看着齐了，画面实际还是落后。
-                val ms = call.argument<Number>("position")?.toLong() ?: 0L
-                seekTo(ms, result)
-                emit("anchored", mapOf("audio" to ms, "video" to player.currentPosition))
-            }
             "position" ->
                 result.success(
                     mapOf(
@@ -272,7 +277,7 @@ class HdrPlayerView(
                 surfaceHidden = false
                 container.visibility = View.VISIBLE
                 setSurfaceAlpha(1f)
-                requestSurfaceHdrBrightness(true)
+                requestSurfaceHdrBrightness(hdrWindowEnabled)
                 result.success(null)
             }
             "dispose" -> {
@@ -347,6 +352,16 @@ class HdrPlayerView(
         reportedSize = null
         lastRenderedPtsUs = C.TIME_UNSET
         baseRate = rate
+        // 上一次播放若是 HDR，换片后要等新码流的色彩信息再决定是否保持 HDR 窗口。
+        if (hdrWindowEnabled) {
+            applyHdrWindow(false)
+        }
+        // 上一次 seek 可能还挂着，别让它等到这次播放的帧才回包。
+        seekTimeout?.let { mainHandler.removeCallbacks(it) }
+        seekTimeout = null
+        seekAnswered = true
+        seekResult = null
+        seekTargetMs = -1L
         // 对齐完成前先藏起来。不能用 INVISIBLE：SurfaceView 不出帧，
         // firstFrame/seek 就会一直等超时。View.alpha 也挡不住独立窗口，
         // 必须走 SurfaceControl.setAlpha。
@@ -375,6 +390,7 @@ class HdrPlayerView(
      * 把 PQ/HLG 交给面板，而不是压成发灰的 SDR。
      */
     private fun applyHdrWindow(enable: Boolean) {
+        hdrWindowEnabled = enable
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val window = activity.window ?: return
         window.colorMode =
@@ -421,6 +437,17 @@ class HdrPlayerView(
                 ),
             )
         }
+    }
+
+    /**
+     * 码流声明的色彩是否是 HDR（PQ / HLG，或 BT.2020 广色域）。
+     * 认不出来时按 SDR 处理：宁可不开 HDR 窗口，也不要把 SDR 画面撑灰。
+     */
+    private fun isHdrColorFormat(format: Format?): Boolean {
+        val color = format?.colorInfo ?: return false
+        return color.colorTransfer == C.COLOR_TRANSFER_ST2084 ||
+            color.colorTransfer == C.COLOR_TRANSFER_HLG ||
+            color.colorSpace == C.COLOR_SPACE_BT2020
     }
 
     private fun hdrSdrRatio(): Float {
@@ -497,6 +524,20 @@ class HdrPlayerView(
             val viewHeight = container.height
             if (viewWidth <= 0 || viewHeight <= 0) return@post
             val viewAspect = viewWidth.toDouble() / viewHeight
+            // 1:1 像素尺寸，给 `原始` / `限制` 两种模式兜底。
+            val nativeWidth =
+                if (videoPixelWidth > 0) videoPixelWidth else (viewHeight * aspect).roundToInt()
+            val nativeHeight =
+                if (videoPixelHeight > 0) videoPixelHeight else viewHeight
+            val containWidth: Int
+            val containHeight: Int
+            if (aspect > viewAspect) {
+                containWidth = viewWidth
+                containHeight = (viewWidth / aspect).roundToInt()
+            } else {
+                containHeight = viewHeight
+                containWidth = (viewHeight * aspect).roundToInt()
+            }
             val targetWidth: Int
             val targetHeight: Int
             when (fitMode) {
@@ -512,14 +553,30 @@ class HdrPlayerView(
                         targetWidth = viewWidth
                         targetHeight = (viewWidth / aspect).roundToInt()
                     }
-                else ->
-                    if (aspect > viewAspect) {
-                        targetWidth = viewWidth
-                        targetHeight = (viewWidth / aspect).roundToInt()
+                "fitWidth" -> {
+                    targetWidth = viewWidth
+                    targetHeight = (viewWidth / aspect).roundToInt()
+                }
+                "fitHeight" -> {
+                    targetHeight = viewHeight
+                    targetWidth = (viewHeight * aspect).roundToInt()
+                }
+                "none" -> {
+                    targetWidth = nativeWidth
+                    targetHeight = nativeHeight
+                }
+                "scaleDown" ->
+                    if (nativeWidth <= containWidth && nativeHeight <= containHeight) {
+                        targetWidth = nativeWidth
+                        targetHeight = nativeHeight
                     } else {
-                        targetHeight = viewHeight
-                        targetWidth = (viewHeight * aspect).roundToInt()
+                        targetWidth = containWidth
+                        targetHeight = containHeight
                     }
+                else -> {
+                    targetWidth = containWidth
+                    targetHeight = containHeight
+                }
             }
             val params =
                 (surfaceView.layoutParams as? FrameLayout.LayoutParams)
@@ -529,13 +586,18 @@ class HdrPlayerView(
             params.height = targetHeight
             params.gravity = Gravity.CENTER
             surfaceView.layoutParams = params
-            player.setVideoScalingMode(C.VIDEO_SCALING_MODE_SCALE_TO_FIT)
+            if (appliedScalingMode != C.VIDEO_SCALING_MODE_SCALE_TO_FIT) {
+                appliedScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT
+                player.setVideoScalingMode(C.VIDEO_SCALING_MODE_SCALE_TO_FIT)
+            }
         }
     }
 
     private fun rememberSize(width: Int, height: Int, pixelRatio: Float) {
         if (width <= 0 || height <= 0) return
         val ratio = if (pixelRatio > 0f) pixelRatio else 1f
+        videoPixelWidth = width
+        videoPixelHeight = height
         val aspect = width.toDouble() * ratio / height
         if (abs(aspect - videoAspect) < 0.001) return
         videoAspect = aspect
@@ -569,6 +631,9 @@ class HdrPlayerView(
             if (playbackState == Player.STATE_READY && !reportedReady) {
                 reportedReady = true
                 val format = player.videoFormat
+                // 只有码流真的是 PQ/HLG 才把整窗切成 HDR：HDR 画质缺流时会
+                // 回退到 SDR 编码，那时开 HDR 窗口会让画面发灰。
+                applyHdrWindow(isHdrColorFormat(format))
                 emit(
                     "ready",
                     mapOf(
