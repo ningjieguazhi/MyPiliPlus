@@ -1,4 +1,4 @@
-import 'dart:async' show StreamSubscription, Timer;
+import 'dart:async' show StreamSubscription, Timer, unawaited;
 import 'dart:convert' show ascii, utf8;
 import 'dart:io' show Platform;
 import 'dart:math' show max, min;
@@ -18,6 +18,7 @@ import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/models_new/video/video_shot/data.dart';
 import 'package:PiliPlus/pages/danmaku/danmaku_model.dart';
 import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
+import 'package:PiliPlus/plugin/pl_player/hdr_backend.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/double_tap_type.dart';
@@ -53,7 +54,7 @@ import 'package:PiliPlus/utils/utils.dart';
 import 'package:archive/archive.dart' show getCrc32;
 import 'package:canvas_danmaku/canvas_danmaku.dart';
 import 'package:easy_debounce/easy_throttle.dart';
-import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/foundation.dart' show debugPrintSynchronously, kDebugMode;
 import 'package:flutter/services.dart'
     show DeviceOrientation, HapticFeedback, KeyDownEvent;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
@@ -76,6 +77,60 @@ typedef PlayOwner = ({String tag, Type type});
 class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   Player? _videoPlayerController;
   VideoController? _videoController;
+
+  /// 安卓 HDR 画面。非空时视频由 Media3 的 SurfaceView 输出，mpv 只解音频。
+  final Rxn<HdrBackend> hdrBackend = Rxn();
+  StreamSubscription<Map<String, dynamic>>? _hdrEvents;
+  Timer? _hdrSyncTimer;
+
+  /// 画面相对音频的固定落后。起播时两路都停在第一帧，一起开跑后这个值
+  /// 应接近 0；若仍有几十毫秒的管道延迟，锁定一次补到 `audio-delay`。
+  Duration? _hdrOffset;
+
+  /// 上一次读到的原始偏差，用来判断偏差是否已经收敛。
+  Duration? _hdrOffsetSample;
+
+  /// 正在重新测量，这段时间的读数不拿来更新偏差。
+  bool _hdrOffsetPending = false;
+
+  /// 偏差已经收敛并写进 `audio-delay`，之后不再改。
+  bool _hdrOffsetLocked = false;
+
+  /// 这次起播要跳到的位置。视图创建是异步的，等它建好时 mpv 的进度可能还是 0。
+  Duration? _hdrOpenAt;
+
+  /// Media3 第一帧还没上屏，音频必须停着等它。
+  bool _hdrFirstFrame = false;
+
+  /// 第一帧出来后要不要立刻开播（自动播放，或用户已经按了播放）。
+  bool _hdrPendingPlay = false;
+
+  /// 第一帧事件超时，避免个别机型暂停时不回调 `onRenderedFirstFrame`。
+  Timer? _hdrFirstFrameTimer;
+
+  /// 片源标称帧率。B 站 DASH 经常不带 fps，Media3 会当成 -1，
+  /// 二倍速时解码器 operating-rate 就不会跟着提高。
+  double? _hdrFrameRate;
+
+  /// 连续长按会叠多个未完成的对齐。世代一变，旧的对齐立刻停。
+  int _hdrRealignEpoch = 0;
+
+  /// 起播时若偏差远大于管道延迟，只允许追一次画面，避免把竞态锁进
+  /// `audio-delay`。
+  bool _hdrStartupResyncDone = false;
+
+  /// HDR 起播前关掉 mpv 音轨。pause/mute 冻不住 `audio-pts`，
+  /// 解码那几百毫秒里音频会自己往前跑。
+  bool _hdrAudioDisabled = false;
+
+  /// mpv 已经 loadfile 完成。不能在 open 之前放行 Media3。
+  bool _hdrMpvOpened = false;
+
+  /// `aid=no` 之前记下的真实音轨。`aid=auto` 在 EDL 上选不回来。
+  AudioTrack? _hdrSavedAudioTrack;
+
+  /// 关掉音轨前的 `lavfi-complex`。图绑的是 `aid1`，恢复时要重挂。
+  String? _hdrLavfiComplex;
 
   static PlPlayerController? _instance;
 
@@ -715,6 +770,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     int? epid,
     int? seasonId,
     int? pgcType,
+    // 清晰度代码，125/126/129 在安卓上尝试走 HDR 画面后端
+    int? quality,
+    double? frameRate,
     VideoType? videoType,
     VoidCallback? onInit,
     Volume? volume,
@@ -751,7 +809,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       if (_playerCount == 0) {
         return;
       }
-      // 配置Player 音轨、字幕等等
+      // 先决定是否走 HDR 画面，再打开 mpv。HDR 时音轨要先关掉，
+      // 否则解码那几百毫秒里 `audio-pts` 会自己往前跑。
+      await _startHdrBackend(dataSource, quality, seekTo, frameRate);
       await _createVideoController(dataSource, seekTo, volume);
 
       if (_playerCount == 0) {
@@ -785,6 +845,500 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   String? shadersDirPath;
+  Future<void> _startHdrBackend(
+    DataSource dataSource,
+    int? quality,
+    Duration? seekTo,
+    double? frameRate,
+  ) async {
+    await _stopHdrBackend();
+    if (dataSource is! NetworkSource || !HdrBackend.isHdrQuality(quality) ||
+        !await HdrBackend.displaySupportsHdr()) {
+      return;
+    }
+    _hdrFrameRate = frameRate != null && frameRate > 0 ? frameRate : null;
+    debugPrintSynchronously(
+      '[PiliHDR] surface requested qn=$quality '
+      'fps=${_hdrFrameRate ?? -1} '
+      'display=${HdrBackend.supported}',
+    );
+    hdrBackend.value = HdrBackend();
+    _hdrOpenAt = seekTo;
+    _hdrFirstFrame = false;
+    _hdrPendingPlay = _autoPlay;
+    _hdrAudioDisabled = false;
+    _hdrMpvOpened = false;
+    _hdrSavedAudioTrack = null;
+    _hdrLavfiComplex = null;
+  }
+
+  /// SurfaceView 创建完成后再打开视频，避免 Media3 没有可输出的表面。
+  Future<void> onHdrViewCreated() async {
+    final backend = hdrBackend.value;
+    final source = dataSource;
+    if (backend == null || !backend.ready || source is! NetworkSource) return;
+    final url = source.videoSource;
+    if (url.isEmpty) return;
+    // HDR 后端比 mpv 更早挂上视图。等 loadfile 完成并关轨后再让
+    // Media3 出帧，否则 firstFrame 会在 audio-pts 还没冻住时就来。
+    for (var i = 0; i < 100; i++) {
+      if (_videoPlayerController != null && _hdrMpvOpened) break;
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    // 视图重建时必须重新等第一帧，否则音频会自己先跑。
+    _hdrPendingPlay = _hdrPendingPlay || playerStatus.isPlaying || _autoPlay;
+    _hdrFirstFrame = false;
+
+    _hdrEvents ??= backend.events.listen((event) {
+      switch (event['event']) {
+        case 'error':
+          unawaited(_stopHdrBackend());
+        case 'ready':
+          backend.mediaReady = true;
+          final width = event['width'];
+          final height = event['height'];
+          if (width is num && height is num && height > 0) {
+            unawaited(
+              backend.setFit(videoFit.value, ratio: width / height),
+            );
+          }
+        case 'firstFrame':
+          unawaited(_onHdrFirstFrame(event));
+        case 'anchored':
+          break;
+        case 'videoSize':
+          final width = event['width'];
+          final height = event['height'];
+          if (width is num && height is num && height > 0) {
+            unawaited(backend.setFit(videoFit.value, ratio: width / height));
+          }
+      }
+    });
+    try {
+      // 视频改由 Media3 输出，mpv 只保留音轨，避免两路 4K 同时硬解。
+      _videoPlayerController?.setProperty('vid', 'no');
+      if (superResolutionType.value != SuperResolutionType.disable) {
+        await setShader(SuperResolutionType.disable);
+      }
+      // pause/mute 冻不住 audio-pts。音轨先关掉，等第一帧对齐后再打开。
+      await _videoPlayerController?.pause();
+      await _disableHdrAudioTrack();
+      // 音频已停住，优先用当前时钟；起播瞬间 audio-pts 还是 0 时才退回
+      // 请求的续播点，避免画面从片头打开。
+      final live = _hdrAudioClock();
+      final state = _videoPlayerController?.state.position;
+      final Duration position;
+      if (live != null && live > const Duration(milliseconds: 200)) {
+        position = live;
+      } else if (state != null && state > const Duration(milliseconds: 200)) {
+        position = state;
+      } else {
+        position = _hdrOpenAt ?? live ?? state ?? Duration.zero;
+      }
+      await backend.open(
+        url: url,
+        position: position,
+        rate: _videoPlayerController?.state.rate ?? playbackSpeed,
+        frameRate: _hdrFrameRate,
+      );
+      await backend.setFit(
+        videoFit.value,
+        ratio: _hdrVideoRatio(videoFit.value),
+      );
+      debugPrintSynchronously(
+        '[PiliHDR] waiting first frame at ${position.inMilliseconds}',
+      );
+      _hdrFirstFrameTimer?.cancel();
+      _hdrFirstFrameTimer = Timer(const Duration(milliseconds: 1500), () {
+        if (_hdrFirstFrame) return;
+        // 个别机型暂停时不出第一帧。这时只让画面跑，音频继续停着，
+        // 等真正上屏再把音频对齐过去，避免声音先自己走。
+        debugPrintSynchronously('[PiliHDR] firstFrame timeout, video only');
+        unawaited(backend.play());
+      });
+    } catch (e) {
+      debugPrintSynchronously('[PiliHDR] surface open failed: $e');
+      await _stopHdrBackend();
+    }
+  }
+
+  /// 第一帧已经解码出来。音轨若还关着，就对齐到这帧再一起开跑。
+  Future<void> _onHdrFirstFrame(Map<String, dynamic> event) async {
+    if (_hdrFirstFrame) return;
+    _hdrFirstFrame = true;
+    _hdrFirstFrameTimer?.cancel();
+    _hdrFirstFrameTimer = null;
+    await _anchorHdr();
+    _hdrSyncTimer ??= Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => _syncHdrPosition(),
+    );
+    var audio = _hdrAudioClock();
+    final videoMs = event['rendered'] ?? event['position'];
+    var video = videoMs is num
+        ? Duration(milliseconds: videoMs.round())
+        : null;
+    debugPrintSynchronously(
+      '[PiliHDR] firstFrame audio=${audio?.inMilliseconds} '
+      'video=${video?.inMilliseconds} '
+      'audioOff=$_hdrAudioDisabled',
+    );
+    try {
+      // 音轨关掉后 audio-pts 不应再自己跑。若仍超前，只能让画面跳到
+      // 当前音频；seek 要等真正上屏的帧，期间若音轨仍开着还会走。
+      if (video != null && audio != null) {
+        final gap = video - audio;
+        if (gap < const Duration(milliseconds: -40)) {
+          _hdrOffsetPending = true;
+          var videoPos = video;
+          try {
+            for (var i = 0; i < 3; i++) {
+              final live = _hdrAudioClock();
+              if (live == null) break;
+              audio = live;
+              debugPrintSynchronously(
+                '[PiliHDR] firstFrame seek video ${videoPos.inMilliseconds} -> '
+                'audio ${live.inMilliseconds} try=$i',
+              );
+              await hdrBackend.value?.seek(live);
+              final latest = await hdrBackend.value?.drift(live);
+              if (latest == null) break;
+              videoPos = latest.video;
+              video = videoPos;
+              if (videoPos >= live - const Duration(milliseconds: 40)) {
+                break;
+              }
+            }
+          } finally {
+            _hdrOffsetPending = false;
+          }
+        } else if (gap > const Duration(milliseconds: 40)) {
+          debugPrintSynchronously(
+            '[PiliHDR] firstFrame seek audio ${audio.inMilliseconds} -> '
+            'video ${video.inMilliseconds}',
+          );
+          await hdrBackend.value?.pause();
+          await _videoPlayerController?.seek(video);
+        }
+      }
+    } finally {
+      // 音轨仍关着。先把画面亮出来；真正开口留给 play()，
+      // 避免 aid=auto 之后、Media3 还没 play 之前 audio-pts 又自己跑。
+      await hdrBackend.value?.show();
+    }
+    _logHdrAudioState(
+      'firstFrame aligned video=${video?.inMilliseconds} '
+      'clock=${_hdrAudioClock()?.inMilliseconds}',
+    );
+    if (_hdrPendingPlay || playerStatus.isPlaying) {
+      await play();
+    }
+    unawaited(_catchUpHdrStartup());
+    _sampleHdrBrightness();
+  }
+
+  AudioTrack? _pickHdrAudioTrack(Player player) {
+    for (final track in player.state.tracks.audio) {
+      if (track.id != 'no' && track.id != 'auto') return track;
+    }
+    final current = player.state.track.audio;
+    if (current.id != 'no' && current.id != 'auto') return current;
+    return null;
+  }
+
+  Future<AudioTrack?> _waitHdrAudioTrack(Player player) async {
+    final existing = _pickHdrAudioTrack(player);
+    if (existing != null) return existing;
+    for (var i = 0; i < 100; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      final track = _pickHdrAudioTrack(player);
+      if (track != null) return track;
+    }
+    debugPrintSynchronously('[PiliHDR] wait audio track timeout');
+    return null;
+  }
+
+  void _logHdrAudioState(String tag) {
+    final player = _videoPlayerController;
+    debugPrintSynchronously(
+      '[PiliHDR] $tag '
+      'aid=${player?.getProperty('aid')} '
+      'mute=${player?.getProperty('mute')} '
+      'pause=${player?.getProperty('pause')} '
+      'pts=${player?.getProperty('audio-pts')} '
+      'track=${player?.state.track.audio.id} '
+      'tracks=${player?.state.tracks.audio.map((t) => t.id).join(',')} '
+      'saved=${_hdrSavedAudioTrack?.id} '
+      'off=$_hdrAudioDisabled',
+    );
+  }
+
+  Future<void> _disableHdrAudioTrack() async {
+    final player = _videoPlayerController;
+    if (player == null) {
+      _hdrAudioDisabled = true;
+      return;
+    }
+    if (_hdrAudioDisabled) {
+      player.setProperty('mute', 'yes');
+      return;
+    }
+    _hdrSavedAudioTrack ??= await _waitHdrAudioTrack(player);
+    if (_hdrSavedAudioTrack == null) {
+      player.setProperty('mute', 'yes');
+      _logHdrAudioState('audioOff skipped, no track yet');
+      return;
+    }
+    final lavfi = player.getProperty('lavfi-complex');
+    if (lavfi.isNotEmpty &&
+        lavfi != '(empty)' &&
+        lavfi != '""' &&
+        lavfi != 'no') {
+      _hdrLavfiComplex = lavfi;
+      player.setProperty('lavfi-complex', '');
+    }
+    player.setProperty('aid', 'no');
+    player.setProperty('mute', 'yes');
+    _hdrAudioDisabled = true;
+    _logHdrAudioState('audioOff');
+  }
+
+  Future<void> _enableHdrAudioTrack() async {
+    final player = _videoPlayerController;
+    if (player == null) {
+      _hdrAudioDisabled = false;
+      return;
+    }
+    if (!_hdrAudioDisabled) {
+      player.setProperty('mute', 'no');
+      return;
+    }
+    final saved = _hdrSavedAudioTrack ?? _pickHdrAudioTrack(player);
+    if (saved != null) {
+      await player.setAudioTrack(saved);
+    } else {
+      player.setProperty('aid', 'auto');
+    }
+    final lavfi = _hdrLavfiComplex;
+    if (lavfi != null && lavfi.isNotEmpty) {
+      player.setProperty('lavfi-complex', lavfi);
+    }
+    player.setProperty('mute', 'no');
+    _hdrAudioDisabled = false;
+    _logHdrAudioState('audioOn');
+    if (player.getProperty('audio-pts').isEmpty ||
+        player.getProperty('aid') == 'no') {
+      _logHdrAudioState('audioOn pts still stale');
+    }
+  }
+
+  Duration? _hdrAudioPts() {
+    if (_hdrAudioDisabled) return null;
+    final raw = _videoPlayerController?.getProperty('audio-pts');
+    if (raw == null || raw.isEmpty) return null;
+    final seconds = double.tryParse(raw);
+    if (seconds == null || seconds < 0) return null;
+    return Duration(microseconds: (seconds * 1e6).round());
+  }
+
+  /// 起播前几秒密集采样亮度曲线，用来判断是解码丢 PQ 还是系统自适应背光。
+  void _sampleHdrBrightness() {
+    var n = 0;
+    Timer.periodic(const Duration(milliseconds: 400), (timer) {
+      n++;
+      if (n > 20 || hdrBackend.value == null) {
+        timer.cancel();
+        return;
+      }
+      final audio = _hdrAudioClock();
+      if (audio == null) return;
+      unawaited(() async {
+        final reading = await hdrBackend.value?.drift(audio);
+        if (reading == null) return;
+        debugPrintSynchronously(
+          '[PiliHDR] brightness t=${n * 400} '
+          'hdrSdr=${reading.hdrSdrRatio} '
+          'winBright=${reading.brightness} '
+          'audio=${audio.inMilliseconds}',
+        );
+      }());
+    });
+  }
+
+  /// mpv 报给界面的 `time-pos` 比音频真实时间戳 `audio-pts` 固定落后一个
+  /// 音频缓冲（实测约 224 毫秒），画面若跟着界面进度走就会一直慢一拍。
+  /// 这里取音频时间戳作为对齐基准。
+  Duration? _hdrAudioClock() {
+    // 音轨关掉后 audio-pts 会停在上一次的值，不能拿来对齐。
+    if (_hdrAudioDisabled) {
+      return _videoPlayerController?.state.position;
+    }
+    final raw = _videoPlayerController?.getProperty('audio-pts');
+    final seconds = raw == null ? null : double.tryParse(raw);
+    if (seconds == null || seconds < 0) {
+      return _videoPlayerController?.state.position;
+    }
+    return Duration(microseconds: (seconds * 1e6).round());
+  }
+
+  /// 把画面的固定落后补到音频上。`audio-delay` 为正表示音频推迟。
+  /// 画面超前时不能把音频往前拽，那种情况改暂停画面等音频追上。
+  void _applyHdrAudioDelay(Duration offset) {
+    if (offset >= Duration.zero) return;
+    _videoPlayerController?.setProperty(
+      'audio-delay',
+      (offset.inMicroseconds / -1e6).toStringAsFixed(3),
+    );
+  }
+
+  /// 画面准备好后开始测量落后。
+  Future<void> _anchorHdr() async {
+    _hdrRealignEpoch++;
+    _hdrOffset = null;
+    _hdrOffsetPending = false;
+    _hdrOffsetSample = null;
+    _hdrOffsetLocked = false;
+    _hdrStartupResyncDone = false;
+  }
+
+  Future<void> _syncHdrPosition() async {
+    final backend = hdrBackend.value;
+    final audio = _hdrAudioClock();
+    // 画面还没进入 STATE_READY 时 Media3 的进度恒为 0，拿来测量没有意义。
+    if (backend == null || !backend.mediaReady || audio == null) return;
+    if (_hdrOffsetPending || isSeeking.value || !_hdrFirstFrame) return;
+    // 长按加速时两路改速有先后，瞬时差不是新的管道延迟。
+    if (longPressStatus.value) return;
+    final reading = await backend.drift(audio);
+    if (reading == null) return;
+    final delay = _videoPlayerController?.getProperty('audio-delay');
+    if (_hdrOffsetLocked) {
+      final offset = _hdrOffset ?? Duration.zero;
+      final corrected = reading.drift - offset;
+      debugPrintSynchronously(
+        '[PiliHDR] sync audio=${audio.inMilliseconds} '
+        'video=${reading.video.inMilliseconds} '
+        'raw=${reading.drift.inMilliseconds} '
+        'offset=${offset.inMilliseconds} '
+        'delay=$delay '
+        'drift=${corrected.inMilliseconds} '
+        'hdrSdr=${reading.hdrSdrRatio} '
+        'speed=${reading.speed}',
+      );
+      // 锁定后不再自动重测。变速的瞬时差由改速后的对齐处理，
+      // 跳转会在 seek() 里清掉补偿再测。
+      return;
+    }
+    // 落后在起播后很快收敛。连续两次读数接近才锁定，
+    // 避免把还在变化的值当成固定落后。
+    final previous = _hdrOffsetSample;
+    _hdrOffsetSample = reading.drift;
+    if (previous == null ||
+        (reading.drift - previous).abs() > const Duration(milliseconds: 40)) {
+      debugPrintSynchronously(
+        '[PiliHDR] sync audio=${audio.inMilliseconds} '
+        'video=${reading.video.inMilliseconds} '
+        'raw=${reading.drift.inMilliseconds} '
+        'delay=$delay '
+        'hdrSdr=${reading.hdrSdrRatio} '
+        'measuring',
+      );
+      return;
+    }
+    // 管道延迟是画面落后音频 20–70ms。画面超前不是延迟，不能锁进 offset。
+    if (previous > const Duration(milliseconds: 40)) {
+      debugPrintSynchronously(
+        '[PiliHDR] sync audio=${audio.inMilliseconds} '
+        'video=${reading.video.inMilliseconds} '
+        'raw=${reading.drift.inMilliseconds} '
+        'delay=$delay '
+        'hdrSdr=${reading.hdrSdrRatio} '
+        'skip lock, video ahead',
+      );
+      _hdrOffsetSample = null;
+      if (playerStatus.isPlaying &&
+          !longPressStatus.value &&
+          !_hdrOffsetPending &&
+          _hdrAudioPts() != null) {
+        _hdrStartupResyncDone = true;
+        unawaited(_holdHdrVideoForAudio(reading.video, _hdrRealignEpoch));
+      }
+      return;
+    }
+    if (previous < const Duration(milliseconds: -150)) {
+      debugPrintSynchronously(
+        '[PiliHDR] sync audio=${audio.inMilliseconds} '
+        'video=${reading.video.inMilliseconds} '
+        'raw=${reading.drift.inMilliseconds} '
+        'delay=$delay '
+        'hdrSdr=${reading.hdrSdrRatio} '
+        'skip lock, startup gap',
+      );
+      _hdrOffsetSample = null;
+      if (!_hdrStartupResyncDone &&
+          playerStatus.isPlaying &&
+          !longPressStatus.value) {
+        _hdrStartupResyncDone = true;
+        unawaited(_speedHdrVideoToAudio(_hdrRealignEpoch));
+      }
+      return;
+    }
+    _hdrOffset = previous;
+    _hdrOffsetLocked = true;
+    _applyHdrAudioDelay(previous);
+    debugPrintSynchronously(
+      '[PiliHDR] sync audio=${audio.inMilliseconds} '
+      'video=${reading.video.inMilliseconds} '
+      'raw=${reading.drift.inMilliseconds} '
+      'offset=${previous.inMilliseconds} '
+      'delay=${_videoPlayerController?.getProperty('audio-delay')} '
+      'hdrSdr=${reading.hdrSdrRatio} '
+      'locked',
+    );
+  }
+
+  /// 画面比例用的视频宽高比。固定比例优先，否则用接口给的分辨率。
+  double? _hdrVideoRatio(VideoFitType fit) {
+    final fixed = fit.aspectRatio;
+    if (fixed != null && fixed > 0) return fixed;
+    final w = width;
+    final h = height;
+    if (w == null || h == null || w <= 0 || h <= 0) return null;
+    return w / h;
+  }
+
+  Future<void> _stopHdrBackend() async {
+    _hdrSyncTimer?.cancel();
+    _hdrSyncTimer = null;
+    await _hdrEvents?.cancel();
+    _hdrEvents = null;
+    _hdrFirstFrameTimer?.cancel();
+    _hdrFirstFrameTimer = null;
+    _hdrFirstFrame = false;
+    _hdrPendingPlay = false;
+    await _enableHdrAudioTrack();
+    final backend = hdrBackend.value;
+    if (backend == null) return;
+    hdrBackend.value = null;
+    _hdrOpenAt = null;
+    _hdrFrameRate = null;
+    _hdrOffset = null;
+    _hdrOffsetPending = false;
+    _hdrOffsetSample = null;
+    _hdrOffsetLocked = false;
+    _hdrStartupResyncDone = false;
+    _hdrMpvOpened = false;
+    _hdrSavedAudioTrack = null;
+    _hdrLavfiComplex = null;
+    _hdrRealignEpoch++;
+    backend.dispose();
+    _videoPlayerController?.setProperty('audio-delay', '0');
+    _videoPlayerController?.setProperty('mute', 'no');
+    if (_videoPlayerController?.state.track.video.id == 'no') {
+      _videoPlayerController?.setProperty('vid', 'auto');
+    }
+  }
+
   Future<String> get copyShadersToExternalDirectory async {
     if (shadersDirPath != null) {
       return shadersDirPath!;
@@ -938,6 +1492,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
 
     assert(!isLive || seekTo == null);
+    if (hdrBackend.value != null) {
+      extras['vid'] = 'no';
+      extras['pause'] = 'yes';
+      extras['mute'] = 'yes';
+    }
     await player.open(
       Media(
         video,
@@ -946,6 +1505,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       ),
       play: false,
     );
+    if (hdrBackend.value != null) {
+      player.setProperty('vid', 'no');
+      player.setProperty('pause', 'yes');
+      player.setProperty('mute', 'yes');
+      await _disableHdrAudioTrack();
+      _hdrMpvOpened = true;
+    }
   }
 
   Future<void>? refreshPlayer() {
@@ -972,9 +1538,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
     _initVideoFit();
 
-    // 自动播放
+    // 自动播放。HDR 画面还没出第一帧时音频必须停着等它，
+    // 否则解码那几百毫秒里声音已经自己往前跑了。
     if (_autoPlay) {
-      playIfExists();
+      if (hdrBackend.value != null) {
+        _hdrPendingPlay = true;
+      } else {
+        playIfExists();
+      }
     }
   }
 
@@ -1067,6 +1638,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
       /// position
       stream.position.listen((Duration position) {
+        // `audio-delay` 只推迟扬声器，不改 `time-pos`。偏差锁定后把进度
+        // 和弹幕一起挪到延迟后的音频上，否则弹幕会比画面早。
+        final offset = _hdrOffset;
+        if (_hdrOffsetLocked && offset != null && offset < Duration.zero) {
+          final shifted = position + offset;
+          position = shifted < Duration.zero ? Duration.zero : shifted;
+        }
         final posInSeconds = position.inSeconds;
 
         if (posInSeconds != this.position.value) {
@@ -1096,6 +1674,21 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           _stopWakeLockTimer();
           _updatePlaybackState();
         }
+      }),
+      stream.videoParams.listen((params) {
+        if (params.w == null && params.pixelformat == null) return;
+        debugPrintSynchronously(
+          '[PiliHDR] decoded ${params.w}x${params.h} '
+          'pixelformat=${params.pixelformat} hw=${params.hwPixelformat} '
+          'primaries=${params.primaries} gamma=${params.gamma} '
+          'colormatrix=${params.colormatrix} levels=${params.colorlevels} '
+          'sigPeak=${params.sigPeak} light=${params.light} '
+          'hwdec=${player.getProperty('hwdec-current')} '
+          'vo=${player.getProperty('current-vo')} '
+          'target-trc=${player.getProperty('target-trc')} '
+          'tone-mapping=${player.getProperty('tone-mapping')} '
+          'sr=${superResolutionType.value.name}',
+        );
       }),
       if (kDebugMode)
         stream.log.listen(((PlayerLog log) {
@@ -1184,7 +1777,24 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
     danmakuController?.clear();
     try {
+      // HDR 跳转时音频不能先走：Media3 落到新位置要花一段时间，
+      // 这段时间 mpv 若继续播，落后会被重新写进管道。
+      final hdr = hdrBackend.value;
+      final resume = hdr != null && playerStatus.isPlaying;
+      if (hdr != null) {
+        await _videoPlayerController?.pause();
+        await hdr.pause();
+        _videoPlayerController?.setProperty('audio-delay', '0');
+        await _anchorHdr();
+        _hdrOffsetPending = true;
+      }
       await _videoPlayerController?.seek(position);
+      await hdr?.seek(position);
+      if (resume) {
+        await _videoPlayerController?.play();
+        await hdr?.play();
+      }
+      _hdrOffsetPending = false;
       _updateIOSPip(position);
     } catch (e) {
       if (kDebugMode) debugPrint('seek failed: $e');
@@ -1213,13 +1823,308 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
   }
 
+  /// 开播后立刻看一次偏差。以前要等 2 秒同步周期，片头那 200ms 会一直挂着。
+  Future<void> _catchUpHdrStartup() async {
+    if (_hdrStartupResyncDone || hdrBackend.value == null) return;
+    await Future<void>.delayed(const Duration(milliseconds: 240));
+    if (_hdrStartupResyncDone ||
+        !_hdrFirstFrame ||
+        !playerStatus.isPlaying ||
+        longPressStatus.value ||
+        isSeeking.value) {
+      return;
+    }
+    final sample = await _hdrDriftSample();
+    if (sample == null) return;
+    final gap = sample.drift;
+    debugPrintSynchronously(
+      '[PiliHDR] startupCatch audio=${sample.audio.inMilliseconds} '
+      'video=${sample.video.inMilliseconds} '
+      'raw=${gap.inMilliseconds}',
+    );
+    if (gap.abs() < const Duration(milliseconds: 40)) return;
+    if (_hdrAudioPts() == null && sample.audio <= Duration.zero) {
+      debugPrintSynchronously('[PiliHDR] startupCatch skip, audio clock stuck');
+      _logHdrAudioState('startupCatch stuck');
+      return;
+    }
+    _hdrStartupResyncDone = true;
+    if (gap < Duration.zero) {
+      await _speedHdrVideoToAudio(_hdrRealignEpoch);
+    } else {
+      await _holdHdrVideoForAudio(sample.video, _hdrRealignEpoch);
+    }
+  }
+
+  /// 变速后重新对齐。起播锁定的 `audio-delay` 是固定管道延迟，这里
+  /// 绝不改写。画面超前冻画面等音频；画面落后把 Media3 略加速追上。
+  /// mpv 暂停后 `audio-pts` 仍会往前走（音频缓冲还在播），不能冻音频。
+  /// 4K 播放中 seek 会卡死，这里绝不 seek。
+  Future<void> _realignHdrAfterRateChange() async {
+    final epoch = _hdrRealignEpoch;
+    await Future<void>.delayed(const Duration(milliseconds: 800));
+    if (epoch != _hdrRealignEpoch) return;
+    final sample = await _stableHdrDriftSample();
+    if (sample == null || epoch != _hdrRealignEpoch) return;
+    final offset = _hdrOffset ?? Duration.zero;
+    final corrected = sample.drift - offset;
+    debugPrintSynchronously(
+      '[PiliHDR] rateAlign audio=${sample.audio.inMilliseconds} '
+      'video=${sample.video.inMilliseconds} '
+      'raw=${sample.drift.inMilliseconds} '
+      'corrected=${corrected.inMilliseconds} '
+      'speed=${sample.speed}',
+    );
+    if (corrected.abs() < const Duration(milliseconds: 80)) return;
+    if (corrected > Duration.zero) {
+      await _holdHdrVideoForAudio(sample.video, epoch);
+      return;
+    }
+    await _speedHdrVideoToAudio(epoch);
+  }
+
+  Future<({Duration drift, Duration video, Duration audio, double? speed})?>
+  _stableHdrDriftSample() async {
+    if (!_hdrReadyToRealign()) return null;
+    final first = await _hdrDriftSample();
+    if (first == null) return null;
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    if (!_hdrReadyToRealign()) return null;
+    final second = await _hdrDriftSample();
+    if (second == null) return null;
+    if ((second.drift - first.drift).abs() > const Duration(milliseconds: 40)) {
+      debugPrintSynchronously(
+        '[PiliHDR] rateAlign measuring '
+        'first=${first.drift.inMilliseconds} '
+        'second=${second.drift.inMilliseconds} '
+        'speed=${second.speed}',
+      );
+      return null;
+    }
+    return second;
+  }
+
+  /// 画面跑到音频前面时冻住画面，等扬声器追上。
+  /// `audio-pts` 不含 `audio-delay`，要对到 `video + delay`。不 seek。
+  Future<void> _holdHdrVideoForAudio(Duration video, int epoch) async {
+    final backend = hdrBackend.value;
+    if (backend == null || epoch != _hdrRealignEpoch) return;
+    // 先冻画面再取样。若先等音频时钟，目标 PTS 会过期，音频一超过旧目标就直接返回。
+    _hdrOffsetPending = true;
+    await backend.pause();
+    if (epoch != _hdrRealignEpoch || hdrBackend.value == null) {
+      _hdrOffsetPending = false;
+      return;
+    }
+    final frozen = await _hdrDriftSample();
+    final frozenVideo = frozen?.video ?? video;
+    final offset = _hdrOffset ?? Duration.zero;
+    final delay = offset < Duration.zero ? -offset : Duration.zero;
+    final target = frozenVideo + delay;
+    var audioNow = _hdrAudioClock();
+    debugPrintSynchronously(
+      '[PiliHDR] catchUp pause video=${frozenVideo.inMilliseconds} '
+      'audio=${audioNow?.inMilliseconds} '
+      'target=${target.inMilliseconds} delay=${delay.inMilliseconds}',
+    );
+    if (audioNow != null &&
+        audioNow >= target - const Duration(milliseconds: 20)) {
+      await backend.play();
+      _hdrOffsetPending = false;
+      return;
+    }
+    final deadline = DateTime.now().add(const Duration(milliseconds: 1500));
+    var timedOut = true;
+    var lastAudio = audioNow;
+    var lastAudioAt = DateTime.now();
+    while (DateTime.now().isBefore(deadline)) {
+      if (epoch != _hdrRealignEpoch ||
+          !_hdrFirstFrame ||
+          hdrBackend.value == null ||
+          longPressStatus.value ||
+          isSeeking.value) {
+        timedOut = false;
+        break;
+      }
+      final audio = _hdrAudioClock();
+      if (audio != null &&
+          audio >= target - const Duration(milliseconds: 20)) {
+        timedOut = false;
+        break;
+      }
+      if (audio != null && lastAudio != null && audio > lastAudio) {
+        lastAudio = audio;
+        lastAudioAt = DateTime.now();
+      } else if (DateTime.now().difference(lastAudioAt) >
+          const Duration(milliseconds: 300)) {
+        debugPrintSynchronously(
+          '[PiliHDR] catchUp skip freeze, audio clock stuck',
+        );
+        _logHdrAudioState('catchUp stuck');
+        timedOut = false;
+        break;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+    }
+    if (epoch != _hdrRealignEpoch || hdrBackend.value == null) {
+      _hdrOffsetPending = false;
+      debugPrintSynchronously('[PiliHDR] catchUp aborted');
+      return;
+    }
+    await backend.play();
+    _hdrOffsetPending = false;
+    debugPrintSynchronously(
+      '[PiliHDR] catchUp resume audio=${_hdrAudioClock()?.inMilliseconds} '
+      'video=${frozenVideo.inMilliseconds} timeout=$timedOut',
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    if (epoch != _hdrRealignEpoch) return;
+    final after = await _hdrDriftSample();
+    if (after == null) return;
+    final locked = _hdrOffset ?? Duration.zero;
+    debugPrintSynchronously(
+      '[PiliHDR] catchUp after audio=${after.audio.inMilliseconds} '
+      'video=${after.video.inMilliseconds} '
+      'raw=${after.drift.inMilliseconds} '
+      'corrected=${(after.drift - locked).inMilliseconds}',
+    );
+  }
+
+  /// 画面落到音频后面时把 Media3 略加速追上。不改 `audio-delay`，
+  /// 也不暂停 mpv：暂停后 `audio-pts` 仍随缓冲往前走。
+  Future<void> _speedHdrVideoToAudio(int epoch) async {
+    final backend = hdrBackend.value;
+    if (backend == null || epoch != _hdrRealignEpoch) return;
+    final offset = _hdrOffset ?? Duration.zero;
+    final baseRate = _videoPlayerController?.state.rate ?? playbackSpeed;
+    const boost = 1.4;
+    final catchRate = baseRate * boost;
+    _hdrOffsetPending = true;
+    await backend.setRate(catchRate);
+    debugPrintSynchronously(
+      '[PiliHDR] catchUp videoBoost base=$baseRate rate=$catchRate '
+      'offset=${offset.inMilliseconds}',
+    );
+    final deadline = DateTime.now().add(const Duration(milliseconds: 2000));
+    var timedOut = true;
+    Duration? videoNow;
+    Duration? audioNow = _hdrAudioClock();
+    while (DateTime.now().isBefore(deadline)) {
+      if (epoch != _hdrRealignEpoch ||
+          !_hdrFirstFrame ||
+          hdrBackend.value == null ||
+          longPressStatus.value ||
+          isSeeking.value) {
+        timedOut = false;
+        break;
+      }
+      audioNow = _hdrAudioClock();
+      if (audioNow == null) {
+        await Future<void>.delayed(const Duration(milliseconds: 40));
+        continue;
+      }
+      final latest = await backend.drift(audioNow);
+      if (latest != null) {
+        videoNow = latest.video;
+        final target = audioNow + offset;
+        if (latest.video >= target - const Duration(milliseconds: 20)) {
+          timedOut = false;
+          break;
+        }
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+    }
+    if (epoch != _hdrRealignEpoch || hdrBackend.value == null) {
+      _hdrOffsetPending = false;
+      debugPrintSynchronously('[PiliHDR] catchUp aborted');
+      return;
+    }
+    await backend.setRate(baseRate);
+    _hdrOffsetPending = false;
+    debugPrintSynchronously(
+      '[PiliHDR] catchUp videoBoostDone video=${videoNow?.inMilliseconds} '
+      'audio=${audioNow?.inMilliseconds} timeout=$timedOut',
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    if (epoch != _hdrRealignEpoch) return;
+    final after = await _hdrDriftSample();
+    if (after == null) return;
+    final locked = _hdrOffset ?? Duration.zero;
+    debugPrintSynchronously(
+      '[PiliHDR] catchUp after audio=${after.audio.inMilliseconds} '
+      'video=${after.video.inMilliseconds} '
+      'raw=${after.drift.inMilliseconds} '
+      'corrected=${(after.drift - locked).inMilliseconds}',
+    );
+  }
+
+  bool _hdrReadyToRealign() {
+    return hdrBackend.value != null &&
+        _hdrFirstFrame &&
+        _hdrOffsetLocked &&
+        !longPressStatus.value &&
+        !isSeeking.value;
+  }
+
+  Future<({Duration drift, Duration video, Duration audio, double? speed})?>
+  _hdrDriftSample() async {
+    final backend = hdrBackend.value;
+    final audio = _hdrAudioClock();
+    if (backend == null || audio == null) return null;
+    final reading = await backend.drift(audio);
+    if (reading == null) return null;
+    return (
+      drift: reading.drift,
+      video: reading.video,
+      audio: audio,
+      speed: reading.speed,
+    );
+  }
+
   /// 设置倍速
   Future<void> setPlaybackSpeed(double speed) async {
     lastPlaybackSpeed = playbackSpeed;
 
-    if (speed == _videoPlayerController?.state.rate) return;
+    if (speed == _videoPlayerController?.state.rate && hdrBackend.value == null) {
+      return;
+    }
 
-    await _videoPlayerController?.setRate(speed);
+    final hdr = hdrBackend.value;
+    if (hdr != null) {
+      _hdrRealignEpoch++;
+      _hdrOffsetPending = true;
+      // 上一次 catch-up 可能冻着画面。新的改速先把两边都拉起来。
+      if (playerStatus.isPlaying) {
+        await (_videoPlayerController?.play() ?? Future<void>.value());
+        await hdr.play();
+      }
+      // Media3 改速几乎是同步的，mpv 要绕一圈 JNI。一起发出去时画面会
+      // 先到新速度，加速后画面超前、减速后也留一截。按方向错开：
+      // 加速先音频，减速先画面。松手后若仍有残差，再冻超前的那一路。
+      final currentRate =
+          _videoPlayerController?.state.rate ?? playbackSpeed;
+      debugPrintSynchronously(
+        '[PiliHDR] setRate $currentRate -> $speed',
+      );
+      if (speed > currentRate + 0.01) {
+        await (_videoPlayerController?.setRate(speed) ?? Future<void>.value());
+        await hdr.setRate(speed);
+      } else if (speed < currentRate - 0.01) {
+        await hdr.setRate(speed);
+        await (_videoPlayerController?.setRate(speed) ?? Future<void>.value());
+      } else {
+        await Future.wait<void>([
+          _videoPlayerController?.setRate(speed) ?? Future<void>.value(),
+          hdr.setRate(speed),
+        ]);
+      }
+      _hdrOffsetPending = false;
+      if (!longPressStatus.value) {
+        unawaited(_realignHdrAfterRateChange());
+      }
+    } else {
+      await _videoPlayerController?.setRate(speed);
+    }
     if (!isLive) _playbackSpeed.value = speed;
     _updatePlaybackState();
     if (danmakuController != null) {
@@ -1244,7 +2149,22 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       await seekTo(Duration.zero, isSeek: false);
     }
 
-    await _videoPlayerController?.play();
+    if (hdrBackend.value != null && !_hdrFirstFrame) {
+      _hdrPendingPlay = true;
+      playerStatus = .playing;
+      audioSessionHandler?.setActive(true);
+      return;
+    }
+
+    // 音轨先选上，再两边一起开。Media3 若先 play，画面会在扬声器出声前跑掉一截；
+    // 音频若先跑再等 pts，画面又会落后等待的那一段时间。
+    await _enableHdrAudioTrack();
+    _videoPlayerController?.setProperty('mute', 'no');
+    await Future.wait<void>([
+      _videoPlayerController?.play() ?? Future<void>.value(),
+      hdrBackend.value?.play() ?? Future<void>.value(),
+    ]);
+    await hdrBackend.value?.show();
 
     audioSessionHandler?.setActive(true);
 
@@ -1253,7 +2173,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   /// 暂停播放
   Future<void> pause({bool notify = true, bool isInterrupt = false}) async {
+    _hdrRealignEpoch++;
+    _hdrPendingPlay = false;
     await _videoPlayerController?.pause();
+    await hdrBackend.value?.pause();
     playerStatus = .paused;
 
     // 主动暂停时让出音频焦点
@@ -1326,6 +2249,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   void toggleVideoFit(VideoFitType value) {
     _prefFit = videoFit.value = value;
     video.put(VideoBoxKey.cacheVideoFit, value.index);
+    final backend = hdrBackend.value;
+    if (backend != null) {
+      unawaited(backend.setFit(value, ratio: _hdrVideoRatio(value)));
+    }
   }
 
   /// 读取fit
@@ -1390,13 +2317,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       videoPlayerController!.state.completed ||
       durationInMilliseconds - positionInMilliseconds <= 50;
 
-  // 双击播放、暂停
+  // 双击播放、暂停。HDR 画面不走 mpv，不能用 playOrPause 绕过同步。
   Future<void> onDoubleTapCenter() async {
     if (!isLive && isCompleted) {
-      await videoPlayerController!.seek(Duration.zero);
-      videoPlayerController!.play();
+      await seekTo(Duration.zero, isSeek: false);
+      await play();
+    } else if (playerStatus.isPlaying) {
+      await pause();
     } else {
-      videoPlayerController!.playOrPause();
+      await play();
     }
   }
 
@@ -1694,6 +2623,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
 
     _removeListeners();
+    // 先藏起来再异步释放。SurfaceView 是独立窗口，等路由拆掉视图才释放的话，
+    // 画面会在下一页上多停留一帧。
+    unawaited(hdrBackend.value?.hide());
+    unawaited(_stopHdrBackend());
     _positionListeners.clear();
     _statusListeners.clear();
     _stopWakeLockTimer();
@@ -1841,6 +2774,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   void onPopInvokedWithResult(bool didPop, Object? result) {
     if (didPop) {
+      unawaited(hdrBackend.value?.hide());
       if (playerStatus.isPlaying) {
         pause();
       }
@@ -1869,6 +2803,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       triggerFullScreen(status: false);
       return;
     }
+    unawaited(hdrBackend.value?.hide());
     Get.back();
   }
 }

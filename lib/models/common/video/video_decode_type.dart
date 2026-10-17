@@ -1,7 +1,8 @@
 // ignore_for_file: constant_identifier_names
 
 enum VideoDecodeFormatType {
-  DVH1(['dvh1']),
+  // dvhe 是杜比视界 Profile 5，没有 HDR10 基线；仍归到这一档，避免 fromString 抛错。
+  DVH1(['dvh1', 'dvhe']),
   AV1(['av01']),
   HEVC(['hev1', 'hvc1']),
   AVC(['avc1']),

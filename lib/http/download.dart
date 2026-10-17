@@ -57,11 +57,6 @@ abstract final class DownloadHttp {
           orElse: () => supportFormats.first,
         );
 
-        final currentDecodeFormats = VideoUtils.selectCodec(
-          targetSupportFormats.codecs!,
-          Pref.preferCodecs,
-        );
-
         entry
           ..typeTag = targetVideoQa.toString()
           ..videoQuality = targetVideoQa
@@ -75,10 +70,11 @@ abstract final class DownloadHttp {
             .where((e) => e.quality.code == targetVideoQa)
             .toList();
 
-        /// 取出符合当前解码格式的videoItem
-        final videoDash = videosList.firstWhere(
-          (e) => currentDecodeFormats.codes.any(e.codecs!.startsWith),
-          orElse: () => videosList.first,
+        /// HDR 三档与播放同一套规则：杜比视界要 dvh1，HDR10 / HDR Vivid 要 HEVC
+        final videoDash = VideoUtils.selectVideo(
+          quality: targetVideoQa,
+          videos: videosList,
+          preferCodecs: Pref.preferCodecs,
         );
 
         final videoUrl = VideoUtils.getCdnUrl(videoDash.playUrls);

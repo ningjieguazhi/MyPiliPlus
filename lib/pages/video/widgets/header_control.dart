@@ -1089,10 +1089,16 @@ class HeaderControlState extends State<HeaderControl>
   // 选择解码格式
   void showSetDecodeFormats() {
     final firstCode = videoDetailCtr.firstVideo.quality.code;
-    // 当前视频可用的解码格式
+    // 当前视频可用的解码格式。HDR 三档只列出能保住 HDR 的编码，
+    // 否则手动切到 AVC/AV1 会把杜比视界 / HDR10 换成同画质的 SDR 流。
     final videoFormat = videoInfo.supportFormats!;
+    final locked = VideoUtils.hdrCodecPrefixes(firstCode);
 
-    final list = videoFormat.firstWhere((e) => e.quality == firstCode).codecs;
+    final list = videoFormat
+        .firstWhere((e) => e.quality == firstCode)
+        .codecs
+        ?.where((e) => locked == null || locked.any(e.startsWith))
+        .toList();
     if (list == null) {
       SmartDialog.showToast('当前视频不支持选择解码格式');
       return;

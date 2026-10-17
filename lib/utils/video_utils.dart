@@ -1,9 +1,11 @@
 import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/video_decode_type.dart';
+import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/models_new/live/live_room_play_info/codec.dart';
 import 'package:PiliPlus/utils/extension/iterable_ext.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
-import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import 'package:flutter/foundation.dart'
+    show debugPrint, debugPrintSynchronously, kDebugMode;
 
 abstract final class VideoUtils {
   static CDNService cdnService = Pref.defaultCDNService;
@@ -95,27 +97,74 @@ abstract final class VideoUtils {
     return (liveCdnUrl ?? urlInfo.host) + e.baseUrl + urlInfo.extra;
   }
 
-  static VideoDecodeFormatType selectCodec(
-    Iterable<String> codecs,
-    List<VideoDecodeFormatType> preferCodecs,
-  ) {
-    if (preferCodecs.isNotEmpty) {
-      int bestIndex = preferCodecs.length;
-      for (final e in codecs) {
-        for (int i = 0; i < bestIndex; i++) {
-          if (preferCodecs[i].codes.any(e.startsWith)) {
-            bestIndex = i;
-            if (bestIndex == 0) {
-              return preferCodecs[0];
-            }
-            break;
-          }
+  // 杜比视界在 B 站对外是 hvc1 的 HLG 基线层（Profile 8.4，RPU 藏在 SEI 里），
+  // dvh1/dvhe 只在极少数片子上出现，放在后面兜底。
+  static const _dolbyPrefixes = ['hvc1', 'dvh1', 'dvhe'];
+  static const _hevcPrefixes = ['hev1', 'hvc1'];
+
+  /// HDR 三档不能交给用户的 AVC/AV1 偏好。返回 null 表示按普通规则选。
+  static List<String>? hdrCodecPrefixes(int quality) {
+    return switch (quality) {
+      126 => _dolbyPrefixes,
+      125 || 129 => _hevcPrefixes,
+      _ => null,
+    };
+  }
+
+  /// 在同一画质的候选流里挑出真正要播的那条。
+  /// HDR 画质按 [hdrCodecPrefixes] 锁定；该编码不存在时回退到
+  /// [preferCodecs]，再没有就用列表第一条，避免选空。
+  static VideoItem selectVideo({
+    required int quality,
+    required List<VideoItem> videos,
+    required List<VideoDecodeFormatType> preferCodecs,
+  }) {
+    if (videos.isEmpty) {
+      debugPrintSynchronously('[PiliHDR] select qn=$quality no streams');
+      throw StateError('no video stream for quality $quality');
+    }
+
+    VideoItem? match(bool Function(String codec) test) {
+      for (final video in videos) {
+        final codec = video.codecs;
+        if (codec != null && test(codec)) return video;
+      }
+      return null;
+    }
+
+    final prefixes = hdrCodecPrefixes(quality);
+    VideoItem? best;
+    var reason = 'prefer-codec';
+    if (prefixes != null) {
+      for (final prefix in prefixes) {
+        best = match((codec) => codec.startsWith(prefix));
+        if (best != null) {
+          reason = 'hdr-codec';
+          break;
         }
       }
-      if (bestIndex < preferCodecs.length) {
-        return preferCodecs[bestIndex];
+      reason = best == null ? 'hdr-fallback' : reason;
+    }
+    if (best == null) {
+      for (final prefer in preferCodecs) {
+        best = match((codec) => prefer.codes.any(codec.startsWith));
+        if (best != null) break;
       }
     }
-    return VideoDecodeFormatType.fromString(codecs.first);
+    if (best == null) {
+      best = videos.first;
+      reason = prefixes == null ? 'first' : 'hdr-first';
+    }
+
+    final offered = videos
+        .map((e) => '${e.codecs}#${e.codecid}/${e.width}x${e.height}')
+        .join(' | ');
+    debugPrintSynchronously(
+      '[PiliHDR] select qn=$quality ${best.quality.desc} '
+      'reason=$reason codec=${best.codecs} codecid=${best.codecid} '
+      '${best.width}x${best.height}@${best.frameRate} '
+      'offered=[$offered]',
+    );
+    return best;
   }
 }

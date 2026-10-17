@@ -70,7 +70,7 @@ import 'package:collection/collection.dart';
 import 'package:dio/dio.dart' show Options;
 import 'package:extended_nested_scroll_view/extended_nested_scroll_view.dart'
     show ExtendedNestedScrollViewState;
-import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/foundation.dart' show debugPrintSynchronously, kDebugMode;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:flutter_volume_controller/flutter_volume_controller.dart';
 import 'package:get/get.dart';
@@ -655,38 +655,47 @@ class VideoDetailController extends GetxController
     }
   }
 
+  void _logPlayUrl(int targetQa) {
+    final streams = data.dash?.video
+        ?.map(
+          (e) =>
+              'qn=${e.id} ${e.codecs}#${e.codecid} ${e.width}x${e.height}@${e.frameRate}',
+        )
+        .join(' | ');
+    final formats = data.supportFormats
+        ?.map((e) => 'qn=${e.quality} ${e.newDesc} codecs=${e.codecs}')
+        .join(' | ');
+    debugPrintSynchronously(
+      '[PiliHDR] playurl bvid=$bvid cid=${cid.value} '
+      'cacheQa=${plPlayerController.cacheVideoQa} targetQn=$targetQa '
+      'prefer=${preferCodecs.map((e) => e.name).join(",")} '
+      'accept=${data.acceptQuality} formats=[$formats] streams=[$streams]',
+    );
+  }
+
   VideoItem findVideoByQa(int qa, {bool setCodecs = false}) {
     /// 根据currentVideoQa和currentDecodeFormats 重新设置videoUrl
     final videoList = data.dash!.video!.where((i) => i.id == qa).toList();
 
+    // 换画质时按目标画质重选编码：HDR 三档锁定 dvh1/HEVC，
+    // 不再沿用上一条流的 AVC/AV1。
+    if (setCodecs) {
+      final video = VideoUtils.selectVideo(
+        quality: qa,
+        videos: videoList,
+        preferCodecs: preferCodecs,
+      );
+      currentDecodeFormats = VideoDecodeFormatType.fromString(video.codecs!);
+      return video;
+    }
+
     final currentCodes = currentDecodeFormats.codes;
-    VideoItem? bestVideo;
-    int bestIndex = preferCodecs.length;
     for (final video in videoList) {
-      final c = video.codecs!;
-      if (currentCodes.any(c.startsWith)) {
+      if (currentCodes.any(video.codecs!.startsWith)) {
         return video;
       }
-      for (int i = 0; i < bestIndex; i++) {
-        if (preferCodecs[i].codes.any(c.startsWith)) {
-          bestIndex = i;
-          bestVideo = video;
-          break;
-        }
-      }
     }
-
-    if (setCodecs) {
-      if (bestIndex < preferCodecs.length) {
-        currentDecodeFormats = preferCodecs[bestIndex];
-      } else {
-        currentDecodeFormats = VideoDecodeFormatType.fromString(
-          videoList.first.codecs!,
-        );
-      }
-    }
-
-    return bestVideo ?? videoList.first;
+    return videoList.first;
   }
 
   /// 更新画质、音质
@@ -758,6 +767,7 @@ class VideoDetailController extends GetxController
       epid: isUgc ? null : epId,
       seasonId: isUgc ? null : seasonId,
       pgcType: isUgc ? null : pgcType,
+      quality: currentVideoQa.value?.code,
       videoType: videoType,
       onInit: () {
         videoState.value = true;
@@ -765,6 +775,7 @@ class VideoDetailController extends GetxController
       },
       width: firstVideo.width,
       height: firstVideo.height,
+      frameRate: double.tryParse(firstVideo.frameRate ?? ''),
       volume: volume,
       autoFullScreenFlag: autoFullScreenFlag,
     );
@@ -946,29 +957,19 @@ class VideoDetailController extends GetxController
       final targetVideoQa = data.findAvailableVideoQuality(cacheVideoQa);
       currentVideoQa.value = VideoQuality.fromCode(targetVideoQa);
 
-      /// 优先顺序 设置中指定解码格式 -> 当前可选的首个解码格式
-      final supportFormats = data.supportFormats!;
-
-      // 根据画质选编码格式
-      currentDecodeFormats = VideoUtils.selectCodec(
-        supportFormats
-            .firstWhere(
-              (e) => e.quality == targetVideoQa,
-              orElse: () => supportFormats.first,
-            )
-            .codecs!,
-        preferCodecs,
-      );
-
-      /// 取出符合当前画质的videoList
+      /// 取出符合当前画质的videoList，HDR 三档按码流锁定编码
       final videosList = data.dash!.video!
           .where((e) => e.quality.code == targetVideoQa)
           .toList();
+      _logPlayUrl(targetVideoQa);
 
-      /// 取出符合当前解码格式的videoItem
-      firstVideo = videosList.firstWhere(
-        (e) => currentDecodeFormats.codes.any(e.codecs!.startsWith),
-        orElse: () => videosList.first,
+      firstVideo = VideoUtils.selectVideo(
+        quality: targetVideoQa,
+        videos: videosList,
+        preferCodecs: preferCodecs,
+      );
+      currentDecodeFormats = VideoDecodeFormatType.fromString(
+        firstVideo.codecs!,
       );
       _setVideoHeight();
 

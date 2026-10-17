@@ -2045,17 +2045,29 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
             child: Obx(
               () {
                 final videoFit = plPlayerController.videoFit.value;
+                final hdr = plPlayerController.hdrBackend.value;
                 return Transform.flip(
                   flipX: plPlayerController.flipX.value,
                   flipY: plPlayerController.flipY.value,
                   child: FittedBox(
                     fit: videoFit.boxFit,
                     alignment: widget.alignment,
-                    child: SimpleVideo(
-                      controller: plPlayerController.videoController!,
-                      fill: widget.fill,
-                      aspectRatio: videoFit.aspectRatio,
-                    ),
+                    child: hdr == null
+                        ? SimpleVideo(
+                            controller: plPlayerController.videoController!,
+                            fill: widget.fill,
+                            aspectRatio: videoFit.aspectRatio,
+                          )
+                        : SizedBox(
+                            width: maxWidth,
+                            height: maxHeight,
+                            child: hdr.buildView(
+                              key: ValueKey(hdr),
+                              onCreated: () => unawaited(
+                                plPlayerController.onHdrViewCreated(),
+                              ),
+                            ),
+                          ),
                   ),
                 );
               },
