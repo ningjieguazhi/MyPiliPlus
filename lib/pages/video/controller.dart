@@ -656,6 +656,7 @@ class VideoDetailController extends GetxController
   }
 
   void _logPlayUrl(int targetQa) {
+    if (!kDebugMode) return;
     final streams = data.dash?.video
         ?.map(
           (e) =>
@@ -676,26 +677,47 @@ class VideoDetailController extends GetxController
   VideoItem findVideoByQa(int qa, {bool setCodecs = false}) {
     /// 根据currentVideoQa和currentDecodeFormats 重新设置videoUrl
     final videoList = data.dash!.video!.where((i) => i.id == qa).toList();
-
-    // 换画质时按目标画质重选编码：HDR 三档锁定 dvh1/HEVC，
-    // 不再沿用上一条流的 AVC/AV1。
-    if (setCodecs) {
-      final video = VideoUtils.selectVideo(
-        quality: qa,
-        videos: videoList,
-        preferCodecs: preferCodecs,
-      );
-      currentDecodeFormats = VideoDecodeFormatType.fromString(video.codecs!);
-      return video;
+    if (videoList.isEmpty) {
+      throw StateError('no video stream for quality $qa');
     }
 
+    /// HDR 三档只允许 HEVC/杜比，手动切到 AVC/AV1 会把 HDR 流换成 SDR。
+    final locked = VideoUtils.hdrCodecPrefixes(qa);
+    bool allowed(String codec) =>
+        locked == null || locked.any(codec.startsWith);
+
+    /// 优先沿用当前选择（含用户在“解码格式”里手选的编码）。
+    /// 旧实现里这条优先级被 setCodecs 分支覆盖，导致手动选择永远不生效。
     final currentCodes = currentDecodeFormats.codes;
     for (final video in videoList) {
-      if (currentCodes.any(video.codecs!.startsWith)) {
+      final codec = video.codecs;
+      if (codec == null) continue;
+      if (allowed(codec) && currentCodes.any(codec.startsWith)) {
         return video;
       }
     }
-    return videoList.first;
+
+    if (!setCodecs) {
+      for (final prefer in preferCodecs) {
+        for (final video in videoList) {
+          final codec = video.codecs;
+          if (codec != null && prefer.codes.any(codec.startsWith)) {
+            return video;
+          }
+        }
+      }
+      return videoList.first;
+    }
+
+    /// 换画质时按目标画质重选编码：HDR 三档锁定 HEVC/杜比，
+    /// 不再沿用上一条流的 AVC/AV1。
+    final video = VideoUtils.selectVideo(
+      quality: qa,
+      videos: videoList,
+      preferCodecs: preferCodecs,
+    );
+    currentDecodeFormats = VideoUtils.decodeFormatOf(video.codecs);
+    return video;
   }
 
   /// 更新画质、音质
@@ -968,9 +990,7 @@ class VideoDetailController extends GetxController
         videos: videosList,
         preferCodecs: preferCodecs,
       );
-      currentDecodeFormats = VideoDecodeFormatType.fromString(
-        firstVideo.codecs!,
-      );
+      currentDecodeFormats = VideoUtils.decodeFormatOf(firstVideo.codecs);
       _setVideoHeight();
 
       videoUrl = VideoUtils.getCdnUrl(firstVideo.playUrls);

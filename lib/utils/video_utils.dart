@@ -111,6 +111,19 @@ abstract final class VideoUtils {
     };
   }
 
+  /// dash 的 `codecs` 字符串映射成枚举。
+  /// 未知（例如 `dolby`）或为空时回退 [fallback]，不要抛异常打断播放。
+  static VideoDecodeFormatType decodeFormatOf(
+    String? codecs, {
+    VideoDecodeFormatType fallback = VideoDecodeFormatType.HEVC,
+  }) {
+    if (codecs == null || codecs.isEmpty) return fallback;
+    for (final format in VideoDecodeFormatType.values) {
+      if (format.codes.any(codecs.startsWith)) return format;
+    }
+    return fallback;
+  }
+
   /// 在同一画质的候选流里挑出真正要播的那条。
   /// HDR 画质按 [hdrCodecPrefixes] 锁定；该编码不存在时回退到
   /// [preferCodecs]，再没有就用列表第一条，避免选空。
@@ -120,7 +133,9 @@ abstract final class VideoUtils {
     required List<VideoDecodeFormatType> preferCodecs,
   }) {
     if (videos.isEmpty) {
-      debugPrintSynchronously('[PiliHDR] select qn=$quality no streams');
+      if (kDebugMode) {
+        debugPrintSynchronously('[PiliHDR] select qn=$quality no streams');
+      }
       throw StateError('no video stream for quality $quality');
     }
 
@@ -159,12 +174,14 @@ abstract final class VideoUtils {
     final offered = videos
         .map((e) => '${e.codecs}#${e.codecid}/${e.width}x${e.height}')
         .join(' | ');
-    debugPrintSynchronously(
-      '[PiliHDR] select qn=$quality ${best.quality.desc} '
-      'reason=$reason codec=${best.codecs} codecid=${best.codecid} '
-      '${best.width}x${best.height}@${best.frameRate} '
-      'offered=[$offered]',
-    );
+    if (kDebugMode) {
+      debugPrintSynchronously(
+        '[PiliHDR] select qn=$quality ${best.quality.desc} '
+        'reason=$reason codec=${best.codecs} codecid=${best.codecid} '
+        '${best.width}x${best.height}@${best.frameRate} '
+        'offered=[$offered]',
+      );
+    }
     return best;
   }
 }
