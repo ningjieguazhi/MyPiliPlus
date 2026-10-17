@@ -102,7 +102,8 @@ flutter {
 }
 
 dependencies {
+    // HDR 画面后端：只解视频，音频仍由 mpv 负责。
+    // media3-datasource 是 media3-exoplayer 的传递依赖，不必显式声明。
     val media3 = "1.8.0"
     implementation("androidx.media3:media3-exoplayer:$media3")
-    implementation("androidx.media3:media3-datasource:$media3")
 }

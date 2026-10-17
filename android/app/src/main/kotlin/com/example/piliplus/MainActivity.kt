@@ -3,7 +3,6 @@ package com.example.piliplus
 import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
-import android.view.Display
 import android.view.WindowManager.LayoutParams
 import com.ryanheise.audioservice.AudioServiceActivity
 import io.flutter.embedding.engine.FlutterEngine
